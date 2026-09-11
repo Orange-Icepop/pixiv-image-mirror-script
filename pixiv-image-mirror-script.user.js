@@ -2,8 +2,8 @@
 // @name         Pixiv Image Domain Replacement
 // @name:zh      Pixiv图片域名替换
 // @namespace    https://github.com/Orange-Icepop/pixiv-image-mirror-script
-// @version      1.3
-// @description  将页面上所有 i.pximg.net 的图片链接域名替换为 i.pixiv.re
+// @version      1.4
+// @description  将页面上所有 i.pximg.net 的图片链接域名替换为镜像/反代站
 // @author       Orange-Icepop Deepseek
 // @match        *://*.pixiv.net/*
 // @grant        none
@@ -12,7 +12,8 @@
 
 (function() {
     'use strict';
-
+    const proxy = "i.pixiv.re";
+    
     // 替换单个 img 元素（如果包含 i.pximg.net 且未被替换过）
     function replaceImg(img) {
         // 避免重复处理
@@ -20,8 +21,8 @@
 
         const src = img.src;
         if (src.includes('i.pximg.net')) {
-            // 将 i.pximg.net 替换为 i.pixiv.re，保持路径不变
-            img.src = src.replace('i.pximg.net', 'i.pixiv.re');
+            // 将 i.pximg.net 替换为代理，保持路径不变
+            img.src = src.replace('i.pximg.net', proxy);
             img.dataset.pxReplaced = 'true';
         }
     }
