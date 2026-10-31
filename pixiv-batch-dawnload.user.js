@@ -2,9 +2,9 @@
 // @name         Pixiv 当前页面图片批量保存 (ZIP / PDF / 逐个下载)
 // @name:en      Pixiv Page Images Batch Save (ZIP / PDF / one by one)
 // @namespace    https://github.com/Orange-Icepop/pixiv-image-mirror-script
-// @version      1.4.0
+// @version      1.5.2
 // @description  抓取当前 pixiv 作品的图片（含镜像/代理域名），默认用页面上已缓存的尺寸，可选原图；内置 ZIP 写入器（无 JSZip），可打包 ZIP 或合成 PDF。
-// @author       Orange-Icepop DeepSeek
+// @author       Orange-Icepop, DeepSeek
 // @match        https://www.pixiv.net/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_download
@@ -34,8 +34,10 @@
 
     /* ================= 基础工具 ================= */
 
-    var state = { items: [], busy: false, pageOk: null, channel: 'auto' };   // pageOk: null 未知 / true 可读 / false CORS 被拒
-    var stat = { page: 0, gm: 0, fail: 0 };
+    // pageCtxOk: 页面上下文 fetch 是否可用；sandboxOk: 沙箱 fetch 是否可用。
+    // 两者都 false 就说明跨域读不到，只能走 GM。
+    var state = { items: [], busy: false, pageCtxOk: null, sandboxOk: null, channel: 'auto' };
+    var stat = {};
 
     function now() {
         return (window.performance && performance.now) ? performance.now() : Date.now();
@@ -45,6 +47,19 @@
     function setStatus(text) {
         if (ui.status) ui.status.textContent = text;
         console.log('[pixiv-save]', text);
+    }
+
+    function hostOf(u) {
+        try { return new URL(u).hostname; } catch (e) { return '?'; }
+    }
+
+    function statText() {
+        var parts = [];
+        ['page', 'sandbox', 'gm'].forEach(function (k) {
+            if (stat[k]) parts.push(k + ' ' + stat[k]);
+        });
+        if (stat.fail) parts.push('失败 ' + stat.fail);
+        return parts.join(' / ') || '无';
     }
 
     function sleep(ms) {
@@ -78,9 +93,14 @@
         return m[1] + '_' + (m[2] !== undefined ? 'p' + m[2] : 'ugoira');
     }
 
+    // 注意：这里的“rank”是**首选度**，不是清晰度。
+    // img-master（master1200）优先，因为它是页面实际显示、也最可能已在缓存里的那一档；
+    // img-original 只在用户勾选“保存原图”时由 fetchOne() 升级得到。
+    // 这样即使页面里混进了 <a href="...img-original..."> 或 data-original，
+    // 也不会把“非原图”模式顶掉。
     function urlRank(pathname) {
-        if (pathname.indexOf('/img-original/') !== -1) return 3;
-        if (pathname.indexOf('/img-master/') !== -1) return 2;
+        if (pathname.indexOf('/img-master/') !== -1) return 3;
+        if (pathname.indexOf('/img-original/') !== -1) return 2;
         return 1;
     }
 
@@ -282,10 +302,13 @@
             try { u = new URL(raw, location.href); } catch (e) { return; }
             if (u.protocol !== 'http:' && u.protocol !== 'https:') return;
             if (!isPixivImage(u)) return;
-            var key = workKey(u.href) || (u.hostname + u.pathname);  // 忽略 query
+            // 关键：不管 DOM 里现在是源站还是代理，一律归一到代理域。
+            // 我们的脚本可能比“域名替换”脚本先跑，此时 img.src 还是 i.pximg.net。
+            var href = rewriteHost(u.href);
+            var key = workKey(href) || (u.hostname + u.pathname);  // 忽略 query
             var rank = urlRank(u.pathname);
             var old = map.get(key);
-            if (!old || rank > old.rank) map.set(key, { key: key, url: u.href, rank: rank });
+            if (!old || rank > old.rank) map.set(key, { key: key, url: href, rank: rank });
         }
 
         var imgs = document.querySelectorAll('img');
@@ -356,7 +379,7 @@
         for (var i = 0; i < body.length; i++) {
             var p = body[i] || {};
             var urls = p.urls || {};
-            var raw = (ui.original && ui.original.checked ? urls.original : urls.regular) || urls.original;
+            var raw = urls.regular || urls.original;   // 原图与否交给 fetchOne 决定，采集阶段不掺和
             if (!raw) continue;
             if (pid && !isOwnWork(raw, pid)) continue;
             var u = rewriteHost(raw);
@@ -394,19 +417,47 @@
 
     /* ================= 抓取 ================= */
 
-    // 首选：页面内 fetch。Referer 由浏览器按 strict-origin-when-cross-origin 自动写成
-    // “https://www.pixiv.net/”，恰好就是这类反代要检查的东西；能读 body 说明代理给了
-    // Access-Control-Allow-Origin。拿不到（CORS/CORP/401）再退回 GM_xmlhttpRequest。
-    async function pageFetch(url) {
-        // force-cache：只要 HTTP 缓存里有（哪怕已过期）就直接用，不再回源；
-        // 没有才发网络请求。图片内容不可变，用过期副本是安全的。
-        var res = await fetch(url, { credentials: 'omit', mode: 'cors', cache: 'force-cache' });
+    // 页面对象。Tampermonkey / Violentmonkey 都会提供 unsafeWindow。
+    function pageWindow() {
+        try { if (typeof unsafeWindow !== 'undefined' && unsafeWindow) return unsafeWindow; } catch (e) {}
+        return null;
+    }
+
+    async function readImage(promise, label) {
+        var res = await promise;
         if (!res.ok) throw new Error('HTTP ' + res.status);
         var ct = (res.headers.get('content-type') || '').toLowerCase();
         if (ct && ct.indexOf('image/') !== 0) throw new Error('非图片：' + ct);
         var blob = await res.blob();
         if (!blob.size) throw new Error('空响应');
-        return blob;
+        return { blob: blob, src: label };
+    }
+
+    // 三层取流：页面上下文 fetch（unsafeWindow）→ 沙箱 fetch → GM。
+    // 页面上下文与 <img> 共用同一个网络缓存分区，这是唯一可能“白嫖”页面缓存的入口；
+    // 沙箱 fetch 有独立 principal，往往要重下，所以放第二层。
+    async function pageFetch(url) {
+        var opt = { credentials: 'omit', mode: 'cors', cache: 'force-cache' };
+        var pw = pageWindow();
+        var lastErr = null;
+
+        if (pw && pw.fetch && state.pageCtxOk !== false) {
+            try {
+                return await readImage(pw.fetch.call(pw, url, opt), 'page');
+            } catch (e) {
+                lastErr = e;
+                if (e && e.name === 'TypeError') state.pageCtxOk = false;
+            }
+        }
+        if (state.sandboxOk !== false) {
+            try {
+                return await readImage(window.fetch(url, opt), 'sandbox');
+            } catch (e2) {
+                lastErr = e2;
+                if (e2 && e2.name === 'TypeError') state.sandboxOk = false;
+            }
+        }
+        throw lastErr || new Error('页面请求失败');
     }
 
     function gmFetch(url) {
@@ -446,26 +497,32 @@
         });
     }
 
-    // 单张取流。auto 模式下第一次 CORS 失败就把 pageOk 置 false，
-    // 之后的图直接走 GM，避免"页面先白下一遍、GM 再下一遍"的双倍流量。
+    // 单张取流。任一层 CORS 失败即标记，后续不再重复“白下一遍”。
     async function fetchVia(url) {
         var mode = state.channel;
         if (mode === 'gm') return { blob: await gmFetch(url), src: 'gm' };
-        if (mode === 'auto' && state.pageOk === false) return { blob: await gmFetch(url), src: 'gm' };
+        if (mode === 'auto' && state.pageCtxOk === false && state.sandboxOk === false) {
+            return { blob: await gmFetch(url), src: 'gm' };
+        }
         try {
-            return { blob: await pageFetch(url), src: 'page' };
+            return await pageFetch(url);
         } catch (e1) {
             if (mode === 'page') throw e1;
-            if (e1 && e1.name === 'TypeError') state.pageOk = false;
             return { blob: await gmFetch(url), src: 'gm' };
         }
     }
 
     async function fetchOne(item, wantOriginal) {
-        var urls = [item.url];
+        var urls = [rewriteHost(item.url)];
         if (wantOriginal) {
-            var o = toOriginal(item.url);
-            if (o && o !== item.url) urls.unshift(o);   // 先试原图，失败回落到页面上的地址
+            var o = toOriginal(urls[0]);
+            if (o && o !== urls[0]) {
+                urls.unshift(o);                        // 先试原图
+                // 原图扩展名未必是 jpg，补一个 png/jpg 互换的候选，最后才回落页面尺寸
+                var alt = /\.jpg$/i.test(o) ? o.replace(/\.jpg$/i, '.png')
+                    : (/\.png$/i.test(o) ? o.replace(/\.png$/i, '.jpg') : '');
+                if (alt) urls.splice(1, 0, alt);
+            }
         }
         var lastErr = null;
         for (var i = 0; i < urls.length; i++) {
@@ -497,7 +554,7 @@
 
     function setBusy(v) {
         state.busy = v;
-        ['btnCollect', 'btnZip', 'btnPdf', 'btnOne'].forEach(function (k) {
+        ['btnCollect', 'btnZip', 'btnPdf', 'btnOne', 'btnDiag'].forEach(function (k) {
             if (ui[k]) ui[k].disabled = v;
         });
         if (ui.channel) ui.channel.disabled = v;
@@ -512,7 +569,7 @@
         var ok = 0, fail = 0;
         var total = state.items.length;
         var tStart = now();
-        stat = { page: 0, gm: 0, fail: 0 };
+        stat = {};
 
         await mapLimit(state.items, CONCURRENCY, async function (item) {
             try {
@@ -520,16 +577,15 @@
                 var name = uniqueName(r.url, r.blob, used);
                 entries.push({ name: name, blob: r.blob });
                 ok++;
-                stat[r.src]++;
+                stat[r.src] = (stat[r.src] || 0) + 1;
                 console.log('[pixiv-save] ' + r.src + ' ' + r.ms + 'ms ' +
-                    (r.blob.size / 1024).toFixed(0) + 'KB ' + name);
+                    (r.blob.size / 1024).toFixed(0) + 'KB [' + hostOf(r.url) + '] ' + name);
             } catch (e) {
                 fail++;
                 stat.fail++;
                 console.warn('[pixiv-save] 失败(' + (e && e.ms) + 'ms) ' + item.url, e);
             }
-            setStatus('抓取中 ' + (ok + fail) + '/' + total +
-                '（页面 ' + stat.page + ' / GM ' + stat.gm + ' / 失败 ' + stat.fail + '）');
+            setStatus('抓取中 ' + (ok + fail) + '/' + total + '（' + statText() + '）');
         });
 
         if (!ok) { setBusy(false); setStatus('全部失败（' + fail + ' 张）'); return; }
@@ -541,10 +597,60 @@
         var tEnd = now();
         saveBlob(out, 'pixiv_' + illustId() + '_' + Date.now() + '.zip');
         setBusy(false);
-        setStatus('完成：' + ok + ' 张（页面 ' + stat.page + ' / GM ' + stat.gm + '）' +
-            '，失败 ' + fail + '，用时 ' + ((tEnd - tStart) / 1000).toFixed(1) + 's');
-        console.log('[pixiv-save] 总计 ' + ((tEnd - tStart) / 1000).toFixed(1) + 's',
-            { page: stat.page, gm: stat.gm, fail: stat.fail, pageOk: state.pageOk });
+        setStatus('完成：' + ok + ' 张，尺寸 ' + (ui.original.checked ? '原图' : '页面') +
+            '（' + statText() + '），用时 ' + ((tEnd - tStart) / 1000).toFixed(1) + 's');
+        console.log('[pixiv-save] 总计 ' + ((tEnd - tStart) / 1000).toFixed(1) + 's', stat, {
+            pageCtxOk: state.pageCtxOk,
+            sandboxOk: state.sandboxOk
+        });
+    }
+
+    // 诊断：同一张图分别用三层去取，看谁命中缓存、响应头里有没有 CORS。
+    // 每一层各下一次（没缓存的情况下），所以只对第一张跑。
+    async function diagnose() {
+        if (state.busy) return;
+        var item = state.items[0] || collect()[0];
+        if (!item) { setStatus('没有候选 URL'); return; }
+        var url = item.url;
+        console.log('[pixiv-save] 诊断 URL:', url);
+
+        var pw = pageWindow();
+        var probes = [
+            ['页面上下文 unsafeWindow.fetch', function () {
+                if (!pw || !pw.fetch) throw new Error('没有 unsafeWindow');
+                return pw.fetch.call(pw, url, { credentials: 'omit', mode: 'cors', cache: 'force-cache' });
+            }],
+            ['沙箱 fetch', function () {
+                return window.fetch(url, { credentials: 'omit', mode: 'cors', cache: 'force-cache' });
+            }]
+        ];
+
+        for (var i = 0; i < probes.length; i++) {
+            var t0 = now();
+            try {
+                var res = await probes[i][1]();
+                var blob = await res.blob();
+                console.log('[pixiv-save] ' + probes[i][0] + ' → OK ' + Math.round(now() - t0) + 'ms ' +
+                    (blob.size / 1024).toFixed(0) + 'KB | cache-control=' +
+                    (res.headers.get('cache-control') || '-') +
+                    ' | ACAO=' + (res.headers.get('access-control-allow-origin') || '-'));
+            } catch (e) {
+                console.log('[pixiv-save] ' + probes[i][0] + ' → 失败 ' + Math.round(now() - t0) + 'ms',
+                    (e && e.name) + ': ' + (e && e.message));
+            }
+        }
+
+        var t1 = now();
+        try {
+            var b = await gmFetch(url);
+            console.log('[pixiv-save] GM_xmlhttpRequest → OK ' + Math.round(now() - t1) + 'ms ' +
+                (b.size / 1024).toFixed(0) + 'KB');
+        } catch (e) {
+            console.log('[pixiv-save] GM_xmlhttpRequest → 失败 ' + Math.round(now() - t1) + 'ms',
+                (e && e.name) + ': ' + (e && e.message));
+        }
+
+        setStatus('诊断结果已打印到控制台（3 次请求）');
     }
 
     function blobToJpeg(blob) {
@@ -591,12 +697,12 @@
         var pages = [];
         var fail = 0;
         var total = state.items.length;
-        stat = { page: 0, gm: 0, fail: 0 };
+        stat = {};
 
         await mapLimit(state.items, CONCURRENCY, async function (item, idx) {
             try {
                 var r = await fetchOne(item, ui.original.checked);
-                stat[r.src]++;
+                stat[r.src] = (stat[r.src] || 0) + 1;
                 var conv = await blobToJpeg(r.blob);
                 conv.idx = idx;
                 pages.push(conv);
@@ -607,8 +713,7 @@
                 stat.fail++;
                 console.warn('[pixiv-save] 失败(' + (e && e.ms) + 'ms) ' + item.url, e);
             }
-            setStatus('处理中 ' + (pages.length + fail) + '/' + total +
-                '（页面 ' + stat.page + ' / GM ' + stat.gm + ' / 失败 ' + stat.fail + '）');
+            setStatus('处理中 ' + (pages.length + fail) + '/' + total + '（' + statText() + '）');
         });
 
         if (!pages.length) { setBusy(false); setStatus('全部失败（' + fail + ' 张）'); return; }
@@ -738,6 +843,12 @@
         btnPdf.textContent = '③ 合成 PDF';
         btnPdf.onclick = savePdf;
 
+        var btnDiag = document.createElement('button');
+        btnDiag.id = 'btnDiag';
+        btnDiag.textContent = '⑤ 诊断缓存（会下一个图）';
+        btnDiag.title = '分别用页面上下文 / 沙箱 / GM 取同一张图，控制台输出耗时与响应头';
+        btnDiag.onclick = diagnose;
+
         var btnOne = document.createElement('button');
         btnOne.id = 'btnOne';
         btnOne.textContent = '④ 逐个交给浏览器下载';
@@ -752,7 +863,8 @@
             '<option value="gm">通道：仅 GM 请求（不走缓存）</option>';
         sel.onchange = function () {
             state.channel = sel.value;
-            state.pageOk = null;
+            state.pageCtxOk = null;
+            state.sandboxOk = null;
             setStatus('通道已切换为 ' + sel.value);
         };
 
@@ -796,6 +908,7 @@
         panel.appendChild(btnCollect);
         panel.appendChild(btnZip);
         panel.appendChild(btnPdf);
+        panel.appendChild(btnDiag);
         panel.appendChild(btnOne);
         panel.appendChild(sel);
         panel.appendChild(labWork);
@@ -811,6 +924,7 @@
             btnZip: btnZip,
             btnPdf: btnPdf,
             btnOne: btnOne,
+            btnDiag: btnDiag,
             original: chk,
             useApi: chkApi,
             onlyWork: chkWork,
@@ -822,8 +936,15 @@
     function main() {
         if (!document.body) { setTimeout(main, 300); return; }
         buildUI();
-        state.items = collect();
-        setStatus('已抓 ' + state.items.length + ' 个 DOM 图，点①可补齐全部页');
+        setStatus('抓取中…');
+        collectAll().then(function (list) {
+            state.items = list;
+            setStatus('就绪：' + list.length + ' 张');
+        }).catch(function (e) {
+            state.items = collect();
+            setStatus('接口失败，仅 DOM：' + state.items.length + ' 张');
+            console.warn('[pixiv-save]', e);
+        });
     }
 
     main();
