@@ -2,7 +2,7 @@
 // @name         Pixiv 当前页面图片批量保存 (ZIP / PDF / 逐个下载)
 // @name:en      Pixiv Page Images Batch Save (ZIP / PDF / one by one)
 // @namespace    https://github.com/Orange-Icepop/pixiv-image-mirror-script
-// @version      1.1.1
+// @version      1.2.0
 // @description  从当前 pixiv 页面 DOM 抓取图片 URL（含镜像/代理域名），可选用页面登录态调 /ajax/illust/{id}/pages 补齐全部页直链，再批量打包成 ZIP、合成 PDF；复用浏览器 cookie 与 HTTP 缓存。
 // @author       Orange-Icepop DeepSeek
 // @match        https://www.pixiv.net/*
@@ -25,7 +25,7 @@
     /* ================= 可配置项 ================= */
 
     // 你的镜像/反代域名（多个用逗号分隔）。换域名时记得同步改 @connect。
-    var PROXY_HOSTS = ['irpp.unsedvmlinuz.dpdns.org'];
+    var PROXY_HOSTS = ['i.pixiv.cat'];
 
     var MIN_SIDE = 200;        // 最长边小于该值的图（头像、图标）跳过
     var CONCURRENCY = 3;       // 并发抓取数，代理站压力大就调成 2
@@ -52,9 +52,43 @@
         return m ? parseInt(m[1], 10) : 0;
     }
 
-    function illustId() {
+    function currentPid() {
         var m = /\/artworks\/(\d+)/.exec(location.pathname);
-        return m ? m[1] : 'page';
+        if (m) return m[1];
+        m = /\/i\/(\d+)/.exec(location.pathname);
+        if (m) return m[1];
+        m = /[?&](?:illust_id|id)=(\d+)/.exec(location.search);
+        if (m) return m[1];
+        return '';
+    }
+
+    // 图片文件名形如 68377968_p0_master1200.jpg / 68377968_ugoira1234.zip，
+    // 用它判断这张图是否属于当前作品。头像、推荐位、广告的 ID 都对不上。
+    // 同一页图在页面上常有多份地址（/c/540x540_70/... 缩略图、/img-master/... 主图），
+    // 统一归并成 "作品ID_p页码" 这一个键，只保留清晰度最高的那条。
+    function workKey(raw) {
+        var p;
+        try { p = new URL(raw, location.href).pathname; } catch (e) { return ''; }
+        var m = /\/(\d+)_(?:p(\d+)|ugoira)/.exec(p);
+        if (!m) return '';
+        return m[1] + '_' + (m[2] !== undefined ? 'p' + m[2] : 'ugoira');
+    }
+
+    function urlRank(pathname) {
+        if (pathname.indexOf('/img-original/') !== -1) return 3;
+        if (pathname.indexOf('/img-master/') !== -1) return 2;
+        return 1;
+    }
+
+    function isOwnWork(raw, pid) {
+        if (!pid) return true;
+        var p;
+        try { p = new URL(raw, location.href).pathname; } catch (e) { return false; }
+        return new RegExp('(?:^|/)' + pid + '_(?:p\\d+|ugoira)').test(p);
+    }
+
+    function illustId() {
+        return currentPid() || 'page';
     }
 
     function isPixivImage(u) {
@@ -151,8 +185,10 @@
             try { u = new URL(raw, location.href); } catch (e) { return; }
             if (u.protocol !== 'http:' && u.protocol !== 'https:') return;
             if (!isPixivImage(u)) return;
-            var key = u.hostname + u.pathname;   // 忽略 query，避免 ?123 去重失败
-            if (!map.has(key)) map.set(key, { key: key, url: u.href });
+            var key = workKey(u.href) || (u.hostname + u.pathname);  // 忽略 query
+            var rank = urlRank(u.pathname);
+            var old = map.get(key);
+            if (!old || rank > old.rank) map.set(key, { key: key, url: u.href, rank: rank });
         }
 
         var imgs = document.querySelectorAll('img');
@@ -170,6 +206,10 @@
         for (var j = 0; j < links.length; j++) add(links[j].href);
 
         var list = Array.from(map.values());
+        var pid = currentPid();
+        if (pid && (!ui.onlyWork || ui.onlyWork.checked)) {
+            list = list.filter(function (x) { return isOwnWork(x.url, pid); });
+        }
         list.sort(function (a, b) {
             return pageNo(a.url) - pageNo(b.url) || a.key.localeCompare(b.key);
         });
@@ -220,16 +260,18 @@
         var body = json && json.body;
         if (!Array.isArray(body) || !body.length) return [];
 
+        var pid = currentPid();
         var out = [];
         for (var i = 0; i < body.length; i++) {
             var p = body[i] || {};
             var urls = p.urls || {};
             var raw = urls.original || urls.regular;
             if (!raw) continue;
+            if (pid && !isOwnWork(raw, pid)) continue;
             var u = rewriteHost(raw);
-            var key;
-            try { key = new URL(u).hostname + new URL(u).pathname; } catch (e) { continue; }
-            out.push({ key: key, url: u, page: i, w: p.width, h: p.height });
+            var key = workKey(u);
+            if (!key) { try { key = new URL(u).hostname + new URL(u).pathname; } catch (e) { continue; } }
+            out.push({ key: key, url: u, rank: 3, page: i, w: p.width, h: p.height });
         }
         return out;
     }
@@ -574,6 +616,15 @@
         btnOne.title = '走浏览器下载栈，可能命中缓存，但请求通常不带 Referer；对只查 Referer 的反代会 403，优先用②';
         btnOne.onclick = saveOneByOne;
 
+        var labWork = document.createElement('label');
+        var chkWork = document.createElement('input');
+        chkWork.type = 'checkbox';
+        chkWork.checked = true;
+        var labWorkText = document.createElement('span');
+        labWorkText.textContent = '仅当前作品（不含头像/推荐）';
+        labWork.appendChild(chkWork);
+        labWork.appendChild(labWorkText);
+
         var labApi = document.createElement('label');
         var chkApi = document.createElement('input');
         chkApi.type = 'checkbox';
@@ -606,6 +657,7 @@
         panel.appendChild(btnZip);
         panel.appendChild(btnPdf);
         panel.appendChild(btnOne);
+        panel.appendChild(labWork);
         panel.appendChild(labApi);
         panel.appendChild(lab);
         panel.appendChild(status);
@@ -620,6 +672,7 @@
             btnOne: btnOne,
             original: chk,
             useApi: chkApi,
+            onlyWork: chkWork,
             status: status
         };
     }
